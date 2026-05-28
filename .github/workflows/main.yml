@@ -1,0 +1,100 @@
+name: Linux RDP Session
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Auto re-trigger every 6 hours
+
+jobs:
+  rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download previous session data
+        uses: actions/download-artifact@v4
+        with:
+          name: rdp-userdata-linux
+          path: /tmp/artifact-restore
+        continue-on-error: true
+
+      - name: Restore user profile from artifact
+        run: |
+          archive="/tmp/artifact-restore/userdata.tar.gz"
+          if [ -f "$archive" ]; then
+            echo "Restoring previous session data..."
+            tar -xzf "$archive" -C /home/runner
+            echo "Restore complete."
+          else
+            echo "No previous session data found. Starting fresh."
+          fi
+
+      - name: Install XRDP and Desktop Environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xrdp xfce4 xfce4-goodies dbus-x11
+          sudo systemctl enable xrdp
+
+      - name: Configure XRDP to use XFCE
+        run: |
+          echo "startxfce4" | sudo tee /etc/skel/.xsession
+          echo "startxfce4" > /home/runner/.xsession
+          sudo chmod +x /home/runner/.xsession
+          sudo sed -i 's/port=3389/port=3389/' /etc/xrdp/xrdp.ini
+          sudo systemctl restart xrdp
+
+      - name: Set RDP password
+        run: |
+          echo "runner:${{ secrets.RDP_PASSWORD }}" | sudo chpasswd
+          echo "RDP password set for runner"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale with fixed hostname
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          sudo tailscale up \
+            --authkey=$TS_AUTHKEY \
+            --hostname=github-rdp-runner-linux \
+            --accept-routes
+          sleep 15
+
+          TS_IP=$(tailscale ip -4)
+          echo "============================================"
+          echo "   TAILSCALE RDP CONNECTION DETAILS"
+          echo "============================================"
+          echo "  Tailscale IP : $TS_IP"
+          echo "  Port         : 3389"
+          echo "  Username     : runner"
+          echo "  Password     : Dev@123456"
+          echo "============================================"
+          echo "  Connect string: ${TS_IP}:3389"
+          echo "============================================"
+
+      - name: Keep session alive (5h 40min)
+        run: |
+          echo "Session is live. RDP in now!"
+          sleep 20400
+
+      - name: Save full user profile to artifact
+        run: |
+          echo "Compressing user profile..."
+          tar -czf /tmp/userdata.tar.gz \
+            --exclude='/home/runner/.cache' \
+            --exclude='/home/runner/.local/share/Trash' \
+            /home/runner
+          echo "Compression done."
+
+      - name: Upload user profile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-userdata-linux
+          path: /tmp/userdata.tar.gz
+          retention-days: 90
+          overwrite: true
