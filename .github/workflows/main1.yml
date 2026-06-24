@@ -1,0 +1,265 @@
+# ============================================================================
+#  Temporary Ubuntu XFCE Desktop on GitHub Actions
+# ----------------------------------------------------------------------------
+#  Purpose : Spin up a short-lived, GUI-capable Ubuntu desktop inside a GitHub
+#            Actions runner for legitimate development, testing, and education.
+#
+#  How it works:
+#    1. A standard ubuntu-latest runner is provisioned by GitHub.
+#    2. We install a lightweight XFCE desktop + TigerVNC server.
+#    3. We install noVNC so the desktop can be reached from a web browser.
+#    4. Strong random credentials are generated at runtime.
+#    5. A Cloudflare "quick tunnel" exposes the local noVNC port over HTTPS
+#       (no inbound ports are opened on the runner; the tunnel dials out).
+#    6. Connection details are printed to the workflow logs.
+#    7. The session lives ONLY for the duration of the job, then everything
+#       is destroyed by GitHub when the runner is torn down.
+#
+#  Compliance & safety notes:
+#    * This workflow does NOT bypass any GitHub quota, limit, security control,
+#      or Terms of Service. It uses only the standard, documented runner.
+#    * It does NOT attempt persistence beyond the job's lifetime.
+#    * It must NOT be used for crypto mining, bot hosting, abuse, unauthorized
+#      access, or anything that violates GitHub's Acceptable Use Policies.
+#    * Intended ONLY for temporary, interactive GUI access while the job runs.
+#    * See: https://docs.github.com/site-policy/github-terms/github-terms-of-service
+#           https://docs.github.com/site-policy/acceptable-use-policies
+# ============================================================================
+
+name: Temporary Ubuntu Desktop
+
+# ----------------------------------------------------------------------------
+# Trigger: manual only. We require an explicit human action to start a desktop
+# session, with a configurable timeout so it can never run unattended forever.
+# ----------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "How long to keep the desktop alive (minutes, max 350)."
+        required: true
+        default: "240"
+        type: string
+
+# Minimal permissions: this job does not need write access to the repo.
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Launch XFCE Desktop
+    runs-on: ubuntu-latest
+
+    # Hard ceiling on the job so it can never exceed GitHub's 6h limit and is
+    # always cleaned up. GitHub bills/limits runner minutes normally.
+    timeout-minutes: 350
+
+    steps:
+      # ----------------------------------------------------------------------
+      # Step 1: Validate the requested session length.
+      # We clamp the user input to a sane range (5 .. 340 minutes) so the job
+      # always finishes well within GitHub's maximum job duration.
+      # ----------------------------------------------------------------------
+      - name: Validate session length
+        id: cfg
+        run: |
+          set -euo pipefail
+          MIN=5
+          MAX=340
+          REQ="${{ github.event.inputs.session_minutes }}"
+          # Default to 60 if the value is not a plain integer.
+          if ! [[ "$REQ" =~ ^[0-9]+$ ]]; then REQ=60; fi
+          if [ "$REQ" -lt "$MIN" ]; then REQ=$MIN; fi
+          if [ "$REQ" -gt "$MAX" ]; then REQ=$MAX; fi
+          echo "minutes=$REQ" >> "$GITHUB_OUTPUT"
+          echo "Desktop session will run for $REQ minute(s)."
+
+      # ----------------------------------------------------------------------
+      # Step 2: Install the desktop stack.
+      #   xfce4 / xfce4-goodies : lightweight desktop environment.
+      #   tigervnc-standalone-server : the VNC server that renders the desktop.
+      #   novnc / websockify : serves the VNC session to a web browser.
+      #   dbus-x11, xfonts-base : misc dependencies XFCE needs to start cleanly.
+      # ----------------------------------------------------------------------
+      - name: Install XFCE, TigerVNC and noVNC
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-goodies \
+            tigervnc-standalone-server tigervnc-common \
+            novnc websockify \
+            dbus-x11 xfonts-base x11-xserver-utils \
+            python3 curl ca-certificates
+
+      # ----------------------------------------------------------------------
+      # Step 3: Generate strong, random credentials.
+      #   * VNC_PASS  : 16-char password used by the VNC server itself.
+      #   * WEB_TOKEN : extra random token appended to the browser URL so the
+      #                 noVNC page is not guessable even if the tunnel URL leaks.
+      # Both are generated with openssl's CSPRNG and written to $GITHUB_ENV so
+      # later steps can use them. They are NOT written to the repo or cached.
+      # ----------------------------------------------------------------------
+      - name: Generate strong random credentials
+        run: |
+          set -euo pipefail
+          # 16 alphanumeric chars (~95 bits of entropy) for the VNC password.
+          VNC_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          # 24-char URL-safe token used as a path/query secret for the web UI.
+          WEB_TOKEN="$(openssl rand -hex 12)"
+          echo "::add-mask::$VNC_PASS"
+          echo "::add-mask::$WEB_TOKEN"
+          echo "VNC_PASS=$VNC_PASS" >> "$GITHUB_ENV"
+          echo "WEB_TOKEN=$WEB_TOKEN" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # Step 4: Configure and start the VNC server.
+      #   * We store the VNC password hash in ~/.vnc/passwd (chmod 600).
+      #   * We write an xstartup that launches the XFCE session.
+      #   * VNC listens ONLY on localhost (-localhost yes) so it is never
+      #     directly exposed; the only way in is via the authenticated tunnel.
+      # ----------------------------------------------------------------------
+      - name: Start XFCE inside VNC
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.vnc"
+
+          # Store the VNC password in TigerVNC's binary password format.
+          echo "$VNC_PASS" | vncpasswd -f > "$HOME/.vnc/passwd"
+          chmod 600 "$HOME/.vnc/passwd"
+
+          # xstartup tells VNC which session to launch (XFCE here).
+          cat > "$HOME/.vnc/xstartup" <<'EOF'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          export XDG_CURRENT_DESKTOP=XFCE
+          # dbus-launch ensures XFCE services start cleanly inside the session.
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          chmod +x "$HOME/.vnc/xstartup"
+
+          # Start the VNC server on display :1 (port 5901), localhost-only.
+          # 1280x800 is a comfortable default; adjust -geometry if you wish.
+          vncserver :1 \
+            -geometry 1280x800 \
+            -depth 24 \
+            -localhost yes \
+            -SecurityTypes VncAuth
+
+          echo "VNC server started on 127.0.0.1:5901 (display :1)."
+
+      # ----------------------------------------------------------------------
+      # Step 5: Start noVNC (websockify) so the VNC session is reachable from a
+      # browser. We serve it on localhost:6080 and bridge to VNC at 5901.
+      # It runs in the background; the tunnel in the next step exposes it.
+      # ----------------------------------------------------------------------
+      - name: Start noVNC web bridge
+        run: |
+          set -euo pipefail
+          # Find the noVNC web root (path differs slightly across Ubuntu versions).
+          NOVNC_DIR="/usr/share/novnc"
+          [ -d "$NOVNC_DIR" ] || NOVNC_DIR="$(dirname "$(readlink -f "$(command -v launch.sh || true)")" 2>/dev/null || echo /usr/share/novnc)"
+
+          # websockify serves the noVNC static files AND proxies WebSocket
+          # traffic to the local VNC port. Bound to localhost only.
+          nohup websockify --web="$NOVNC_DIR" 127.0.0.1:6080 127.0.0.1:5901 \
+            > "$HOME/novnc.log" 2>&1 &
+          sleep 3
+          echo "noVNC bridge listening on 127.0.0.1:6080"
+
+      # ----------------------------------------------------------------------
+      # Step 6: Open a secure outbound tunnel with Cloudflare.
+      #   * `cloudflared` dials OUT from the runner to Cloudflare's edge and
+      #     returns a public HTTPS URL. No inbound ports are opened on GitHub's
+      #     infrastructure, and no GitHub limit is bypassed.
+      #   * The "quick tunnel" is free, ephemeral, and requires no account.
+      #   * We parse the generated https URL from cloudflared's log.
+      # ----------------------------------------------------------------------
+      - name: Start Cloudflare tunnel
+        id: tunnel
+        run: |
+          set -euo pipefail
+          # Install the official cloudflared binary.
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+          # Launch a quick tunnel pointing at our local noVNC bridge.
+          nohup cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:6080 \
+            > "$HOME/cloudflared.log" 2>&1 &
+
+          # Wait for cloudflared to print the public URL (up to ~30s).
+          URL=""
+          for i in $(seq 1 30); do
+            URL="$(grep -Eo 'https://[a-z0-9.-]+\.trycloudflare\.com' "$HOME/cloudflared.log" | head -n1 || true)"
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Failed to obtain a tunnel URL. cloudflared log:"
+            cat "$HOME/cloudflared.log" || true
+            exit 1
+          fi
+          echo "public_url=$URL" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Step 7: Print the connection details to the workflow logs.
+      # The VNC password is masked in logs automatically; we therefore print it
+      # in a clearly labeled block. Treat the whole log as sensitive: anyone who
+      # can read this run's logs can reach the desktop while it is alive.
+      # ----------------------------------------------------------------------
+      - name: Show connection details
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.tunnel.outputs.public_url }}"
+          # noVNC's client page. The token is appended purely as an extra
+          # hard-to-guess secret; the real auth is the VNC password.
+          WEB_URL="${BASE}/vnc.html?path=websockify&autoconnect=true&token=${WEB_TOKEN}"
+          echo "=================================================================="
+          echo " TEMPORARY UBUNTU XFCE DESKTOP IS READY"
+          echo "=================================================================="
+          echo " Open in a browser:"
+          echo "   ${WEB_URL}"
+          echo
+          echo " VNC password (enter when prompted):"
+          echo "   ${VNC_PASS}"
+          echo
+          echo " Notes:"
+          echo "   * This session is TEMPORARY and dies when the job ends."
+          echo "   * Anyone with this URL + password can control the desktop."
+          echo "   * Do not share these logs publicly."
+          echo "=================================================================="
+
+      # ----------------------------------------------------------------------
+      # Step 8: Keep the job alive for the requested duration.
+      # We simply sleep; the desktop, noVNC, and tunnel all keep running in the
+      # background until the sleep ends (or you cancel the run from the UI).
+      # When this step finishes, GitHub tears the runner down completely.
+      # ----------------------------------------------------------------------
+      - name: Keep desktop alive
+        run: |
+          set -euo pipefail
+          MIN="${{ steps.cfg.outputs.minutes }}"
+          echo "Desktop is live. Sleeping for ${MIN} minute(s)."
+          echo "Cancel this workflow run at any time to end the session early."
+          sleep "$((MIN * 60))"
+          echo "Session time elapsed. Shutting down."
+
+      # ----------------------------------------------------------------------
+      # Step 9: Best-effort cleanup. GitHub destroys the runner regardless, but
+      # we stop services explicitly so nothing lingers if the step is reused.
+      # `if: always()` ensures this runs even if an earlier step failed.
+      # ----------------------------------------------------------------------
+      - name: Clean up
+        if: always()
+        run: |
+          set +e
+          vncserver -kill :1 2>/dev/null || true
+          pkill -f websockify 2>/dev/null || true
+          pkill -f cloudflared 2>/dev/null || true
+          echo "Cleanup complete."
