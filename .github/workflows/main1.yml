@@ -121,9 +121,12 @@ jobs:
           VNC_PASS="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
           # 24-char URL-safe token used as a path/query secret for the web UI.
           WEB_TOKEN="$(openssl rand -hex 12)"
-          # Mask both so they are redacted everywhere GitHub can detect them.
-          echo "::add-mask::$VNC_PASS"
-          echo "::add-mask::$WEB_TOKEN"
+          # NOTE: We intentionally do NOT call "::add-mask::" here. Masking would
+          # redact the password EVERYWHERE in the logs -- including the block in
+          # Step 7 that is supposed to show it -- so it would print as "***" and
+          # you could never read it. Since the whole point is to display the
+          # connection details in the run logs, we leave it unmasked. Treat the
+          # entire run log as a secret (see the warning in Step 7).
           echo "VNC_PASS=$VNC_PASS" >> "$GITHUB_ENV"
           echo "WEB_TOKEN=$WEB_TOKEN" >> "$GITHUB_ENV"
 
@@ -226,8 +229,8 @@ jobs:
 
       # ----------------------------------------------------------------------
       # Step 7: Print the connection details to the workflow logs.
-      # The VNC password is masked in logs by GitHub; we still print it in a
-      # clearly labeled block. Treat the whole log as sensitive: anyone who can
+      # The VNC password is printed in clear text here (it is deliberately NOT
+      # masked -- see Step 3). Treat the whole log as sensitive: anyone who can
       # read this run's logs can reach the desktop while it is alive.
       # ----------------------------------------------------------------------
       - name: Show connection details
