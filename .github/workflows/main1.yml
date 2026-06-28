@@ -10,22 +10,18 @@
 #       x11vnc (a VNC server that attaches to that display).
 #    3. We install noVNC so the desktop can be reached from a web browser.
 #    4. Strong random credentials are generated at runtime.
-#    5. A Cloudflare "quick tunnel" exposes the local noVNC port over HTTPS
-#       (no inbound ports are opened on the runner; the tunnel dials out).
+#    5. A Cloudflare "quick tunnel" exposes the local noVNC port over HTTPS.
 #    6. Connection details are printed to the workflow logs.
-#    7. The session lives ONLY for the duration of the job, then everything
+#    7. The home directory is snapshotted at the end of each run and restored
+#       at the start of the next, giving cross-session continuity.
+#    8. The session lives ONLY for the duration of the job, then everything
 #       is destroyed by GitHub when the runner is torn down.
-#
-#  Why Xvfb + x11vnc (instead of TigerVNC's vncserver):
-#    The TigerVNC `vncpasswd` helper is not reliably installed on the current
-#    ubuntu-latest image, which causes "vncpasswd: command not found".
-#    x11vnc ships its own `-storepasswd`, so we can create the password file
-#    without any extra helper. This combo is the most robust on CI runners.
 #
 #  Compliance & safety notes:
 #    * This workflow does NOT bypass any GitHub quota, limit, security control,
 #      or Terms of Service. It uses only the standard, documented runner.
-#    * It does NOT attempt persistence beyond the job's lifetime.
+#    * It does NOT attempt persistence of the RUNNER beyond the job's lifetime;
+#      only user files are snapshotted as artifacts between manual runs.
 #    * It must NOT be used for crypto mining, bot hosting, abuse, unauthorized
 #      access, or anything that violates GitHub's Acceptable Use Policies.
 #    * Intended ONLY for temporary, interactive GUI access while the job runs.
@@ -80,6 +76,34 @@ jobs:
           if [ "$REQ" -gt "$MAX" ]; then REQ=$MAX; fi
           echo "minutes=$REQ" >> "$GITHUB_OUTPUT"
           echo "Desktop session will run for $REQ minute(s)."
+
+      # ----------------------------------------------------------------------
+      # Step 1b: Restore the persisted home directory from the most recent run.
+      # We pull the latest "home-persist" artifact (if one exists) and unpack it
+      # into $HOME so files from previous sessions reappear. On the very first
+      # run there is nothing to restore, which is fine (continue-on-error).
+      # ----------------------------------------------------------------------
+      - name: Restore persisted home directory
+        id: restore
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: home-persist
+          workflow: ${{ github.workflow }}
+          if_no_artifact_found: ignore
+          path: /tmp/home-restore
+
+      - name: Unpack restored home
+        if: always()
+        run: |
+          set +e
+          if [ -f /tmp/home-restore/home.tar.gz ]; then
+            echo "Restoring previous home directory..."
+            tar -xzf /tmp/home-restore/home.tar.gz -C "$HOME" 2>/dev/null
+            echo "Home restored."
+          else
+            echo "No previous home archive found (first run?). Starting fresh."
+          fi
 
       # ----------------------------------------------------------------------
       # Step 2: Install the desktop stack.
@@ -147,9 +171,9 @@ jobs:
           x11vnc -storepasswd "$VNC_PASS" "$HOME/.vnc/passwd"
           chmod 600 "$HOME/.vnc/passwd"
 
-          # Start a virtual framebuffer X server on display :1 (1280x800, 24-bit).
+          # Start a virtual framebuffer X server on display :1 (1280x720, 24-bit / 720p).
           export DISPLAY=:1
-          Xvfb :1 -screen 0 1280x800x24 -ac > "$HOME/xvfb.log" 2>&1 &
+          Xvfb :1 -screen 0 1280x720x24 -ac > "$HOME/xvfb.log" 2>&1 &
 
           # Wait until the X display is actually accepting connections.
           for i in $(seq 1 20); do
@@ -241,7 +265,7 @@ jobs:
           # hard-to-guess secret; the real auth is the VNC password.
           WEB_URL="${BASE}/vnc.html?path=websockify&autoconnect=true&token=${WEB_TOKEN}"
           echo "=================================================================="
-          echo " TEMPORARY UBUNTU XFCE DESKTOP IS READY"
+          echo " TEMPORARY UBUNTU XFCE DESKTOP IS READY (720p)"
           echo "=================================================================="
           echo " Open in a browser:"
           echo "   ${WEB_URL}"
@@ -251,6 +275,7 @@ jobs:
           echo
           echo " Notes:"
           echo "   * This session is TEMPORARY and dies when the job ends."
+          echo "   * Your home directory is snapshotted and restored next run."
           echo "   * Anyone with this URL + password can control the desktop."
           echo "   * Do not share these logs publicly."
           echo "=================================================================="
@@ -269,6 +294,34 @@ jobs:
           echo "Cancel this workflow run at any time to end the session early."
           sleep "$((MIN * 60))"
           echo "Session time elapsed. Shutting down."
+
+      # ----------------------------------------------------------------------
+      # Step 8b: Archive the home directory so the next run can restore it.
+      # We exclude large/transient junk (caches, the restore temp, sockets) to
+      # stay well under artifact size limits. Runs even if the session was
+      # cancelled, so your work is saved on early exit.
+      # ----------------------------------------------------------------------
+      - name: Archive home directory
+        if: always()
+        run: |
+          set +e
+          echo "Archiving home directory..."
+          tar -czf /tmp/home.tar.gz \
+            --exclude="$HOME/.cache" \
+            --exclude="$HOME/.npm" \
+            --exclude="$HOME/.vnc/passwd" \
+            -C "$HOME" . 2>/dev/null
+          echo "Archive size:"
+          du -h /tmp/home.tar.gz || true
+
+      - name: Upload persisted home directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: home-persist
+          path: /tmp/home.tar.gz
+          retention-days: 7
+          overwrite: true
 
       # ----------------------------------------------------------------------
       # Step 9: Best-effort cleanup. GitHub destroys the runner regardless, but
