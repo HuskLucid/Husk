@@ -1,174 +1,61 @@
-name: 🖥️ Temporary VPS (tmate + Docker + Tunnel)
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
-
-env:
-  TMATE_WAIT_TIMEOUT: "360"
-  KEEP_ALIVE_INTERVAL: "300"
-  EXTRA_PACKAGES: "docker.io tmux htop curl wget git vim unzip jq"
-  ENABLE_CLOUDFLARE_TUNNEL: "true"
-  TUNNEL_LOCAL_PORT: "8080"
-  PERSIST_DIR: "/home/runner/workspace"
-
-permissions:
-  contents: read
-  actions: read
+name: VPS (tmate + Docker)
+on: [workflow_dispatch]
 
 jobs:
-  vps:
-    name: VPS Session (${{ github.run_id }})
+  shell:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     concurrency:
-      group: temporary-vps
+      group: vps
       cancel-in-progress: true
 
     steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      # 1️⃣ NUKE CONFLICTING UBUNTU PACKAGES FIRST
+      - name: 🧹 Remove conflicting containerd (Ubuntu default)
+        run: |
+          sudo apt-get remove -y containerd containerd.io docker.io docker-doc docker-compose docker-compose-v2 podman-docker runc 2>/dev/null || true
+          sudo apt-get autoremove -y
 
-      - name: 🗂️ Restore Workspace
-        uses: actions/cache/restore@v4
-        id: cache-restore
-        with:
-          path: ${{ env.PERSIST_DIR }}
-          key: vps-workspace-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: vps-workspace-${{ github.run_id }}-
+      # 2️⃣ INSTALL DOCKER VIA OFFICIAL SCRIPT (handles repos, keys, containerd.io, plugins)
+      - name: 🐳 Install Docker (official script)
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          # Verify
+          docker version
 
-      - name: 📦 Install Packages & Docker
+      # 3️⃣ INSTALL YOUR TOOLBOX
+      - name: 🛠️ Install Tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ${{ env.EXTRA_PACKAGES }}
-          
-          if [ "${{ env.ENABLE_CLOUDFLARE_TUNNEL }}" = "true" ]; then
-            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cf.deb
-            sudo dpkg -i /tmp/cf.deb || sudo apt-get install -f -y
-          fi
+          sudo apt-get install -y tmux htop curl wget git vim unzip jq
 
-          sudo systemctl start docker
-          sudo systemctl enable docker
-          sudo usermod -aG docker $USER
-          newgrp docker <<< "echo 'Docker ready'"
-
-      - name: ⚙️ Custom Bootstrap
+      # 4️⃣ WRITE TMATE STARTUP SCRIPT (safe, no YAML heredoc issues)
+      - name: 📝 Write tmate Startup Script
         run: |
-          set -euo pipefail
-          echo "🛠️ Running bootstrap..."
-          cat > ${{ env.PERSIST_DIR }}/.vps-info <<EOF
-          VPS Started: $(date)
-          Run ID: ${{ github.run_id }}
-          Workspace: ${{ env.PERSIST_DIR }}
-          EOF
-
-      # ──────────────────────────────────────────────────────────────
-      # GENERATE STARTUP SCRIPT (Avoids YAML indentation/parsing hell)
-      # ──────────────────────────────────────────────────────────────
-      - name: 📝 Generate tmate Startup Script
-        id: gen-script
-        run: |
-          cat > /tmp/tmate_startup.sh << 'STARTUP_SCRIPT_EOF'
+          cat > /tmp/tmate_start.sh << 'EOF'
           #!/bin/bash
-          set -e
-          
-          # 1. Go to workspace
-          cd "${PERSIST_DIR}"
-          
-          # 2. Start Cloudflare Tunnel (background)
-          if [ "${ENABLE_CLOUDFLARE_TUNNEL}" = "true" ]; then
-            echo "☁️  Starting Cloudflare Tunnel on port ${TUNNEL_LOCAL_PORT}..."
-            nohup cloudflared tunnel --url "http://localhost:${TUNNEL_LOCAL_PORT}" --no-autoupdate > /tmp/tunnel.log 2>&1 &
-            echo $! > /tmp/tunnel.pid
-            
-            # Wait for URL
-            for i in {1..15}; do
-              if grep -q 'trycloudflare.com' /tmp/tunnel.log; then
-                URL=$(grep -o 'https://[^ ]*trycloudflare.com' /tmp/tunnel.log | head -1)
-                echo "🌍 PUBLIC URL: ${URL}"
-                # Export to GH Actions env for the summary step
-                echo "TUNNEL_URL=${URL}" >> "${GITHUB_ENV}"
-                break
-              fi
-              sleep 1
-            done
-          fi
-          
-          # 3. Start tmux session
-          tmux new-session -d -s vps -c "${PERSIST_DIR}"
-          
-          # 4. Print Banner
+          cd /home/runner/workspace
+          tmux new-session -d -s vps 2>/dev/null || true
           echo ""
-          echo "╔═══════════════════════════════════════════════════════════════╗"
-          echo "║                    🖥️  TEMPORARY VPS READY                    ║"
-          echo "╠═══════════════════════════════════════════════════════════════╣"
-          echo "║  Workspace:   ${PERSIST_DIR}                                  ║"
-          echo "║  Docker:      ✅ Running                                      ║"
-          echo "║  tmux:        Session 'vps' (attach: tmux a -t vps)           ║"
-          if [ "${ENABLE_CLOUDFLARE_TUNNEL}" = "true" ]; then
-            echo "║  Tunnel:      🌍 Active (check log above)                       ║"
-          else
-            echo "║  Tunnel:      ❌ Disabled                                      ║"
-          fi
-          echo "║  Timeout:     6 hours                                         ║"
-          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo "╔══════════════════════════════════════╗"
+          echo "║     🖥️  VPS READY — SSH CONNECTED     ║"
+          echo "╠══════════════════════════════════════╣"
+          echo "║  Docker:  $(docker --version)        ║"
+          echo "║  tmux:    session 'vps'               ║"
+          echo "║  Dir:     $(pwd)                      ║"
+          echo "║  Timeout: 6 hours                     ║"
+          echo "╚══════════════════════════════════════╝"
           echo ""
-          
-          # 5. Attach to tmux (blocks here until session ends)
-          exec tmux attach-session -t vps
-          STARTUP_SCRIPT_EOF
-          
-          chmod +x /tmp/tmate_startup.sh
-          echo "script_path=/tmp/tmate_startup.sh" >> $GITHUB_OUTPUT
+          exec tmux attach -t vps
+          EOF
+          chmod +x /tmp/tmate_start.sh
 
+      # 5️⃣ LAUNCH TMATE
       - name: 🔐 Start tmate Session
         uses: mxschmitt/action-tmate@v3
-        id: tmate
         timeout-minutes: 360
         with:
           limit-access-to-actor: true
-          wait-for-connection: ${{ env.TMATE_WAIT_TIMEOUT }}
           detached: true
-          # SIMPLE CALL - No complex YAML strings here
-          before-script: bash ${{ steps.gen-script.outputs.script_path }}
-        env:
-          # Pass env vars explicitly so the generated script sees them
-          PERSIST_DIR: ${{ env.PERSIST_DIR }}
-          ENABLE_CLOUDFLARE_TUNNEL: ${{ env.ENABLE_CLOUDFLARE_TUNNEL }}
-          TUNNEL_LOCAL_PORT: ${{ env.TUNNEL_LOCAL_PORT }}
-          GITHUB_ENV: ${{ env.GITHUB_ENV }} # Pass path to env file for URL export
-
-      - name: 📋 Print Connection Details
-        if: always()
-        run: |
-          echo "================== 🔗 CONNECTION INFO =================="
-          echo "SSH Command:"
-          echo "  ${{ steps.tmate.outputs.ssh }}"
-          echo ""
-          echo "Web Terminal:"
-          echo "  ${{ steps.tmate.outputs.web }}"
-          echo ""
-          if [ -n "${{ env.TUNNEL_URL }}" ]; then
-            echo "🌍 Public HTTPS Tunnel:"
-            echo "  ${{ env.TUNNEL_URL }}"
-            echo ""
-          fi
-          echo "📁 Persistent Workspace:"
-          echo "  ${{ env.PERSIST_DIR }}"
-          echo "========================================================="
-
-      - name: 💾 Save Workspace
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.PERSIST_DIR }}
-          key: vps-workspace-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: 💓 Keep Alive
-        if: always()
-        run: |
-          echo "⏳ Heartbeat mode..."
-          while true; do sleep ${{ env.KEEP_ALIVE_INTERVAL }}; echo "$(date -u +%H:%M:%S) UTC — Alive"; done
+          wait-for-connection: 3600
+          before-script: bash /tmp/tmate_start.sh
