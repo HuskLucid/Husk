@@ -124,10 +124,10 @@ jobs:
           wait-for-connection: ${{ env.TMATE_WAIT_TIMEOUT }}
           
           # Keep the session alive even if you disconnect
-          # (tmate keeps the shell running in background)
           detached: true
           
           # Commands to run *inside* the tmate session before handing over
+          # CRITICAL: Indentation must be exactly 2 spaces deeper than 'before-script:'
           before-script: |
             # 1. Enter persistent workspace
             cd ${{ env.PERSIST_DIR }}
